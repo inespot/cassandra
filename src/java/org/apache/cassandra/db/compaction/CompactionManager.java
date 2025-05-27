@@ -1559,6 +1559,14 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
         return false;
     }
 
+
+    /* Used in tests. */
+    @VisibleForTesting
+    void doCleanupOne(final ColumnFamilyStore cfs, LifecycleTransaction txn, Collection<Range<Token>> ranges) throws IOException
+    {
+        doCleanupOne(cfs, txn, CleanupStrategy.get(cfs, ranges, Collections.emptySet(), txn.onlyOne().isRepaired(), FBUtilities.nowInSeconds()), ranges,false);
+    }
+
     /**
      * This function goes over a file and removes the keys that the node is not responsible for
      * and only keeps keys that this node is responsible for.

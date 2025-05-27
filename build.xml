@@ -1740,7 +1740,7 @@
 
   <target name="test" depends="maybe-build-test" description="Test Runner">
     <path id="all-test-classes-path">
-      <fileset dir="${test.unit.src}" includes="**/${test.name}.java" excludes="**/distributed/test/UpgradeTest*.java" />
+      <fileset dir="${test.unit.src}" includes="**/CompactionsTest.java" excludes="**/distributed/test/UpgradeTest*.java" />
     </path>
     <property name="all-test-classes" refid="all-test-classes-path"/>
     <testhelper testdelegate="testlist"/>

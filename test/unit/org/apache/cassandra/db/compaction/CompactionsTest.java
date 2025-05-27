@@ -18,11 +18,14 @@
 */
 package org.apache.cassandra.db.compaction;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.BeforeClass;
@@ -45,10 +48,12 @@ import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
 import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.marshal.ValueAccessors;
 import org.apache.cassandra.db.partitions.FilteredPartition;
 import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
@@ -78,13 +83,14 @@ import org.apache.cassandra.utils.FBUtilities;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 public class CompactionsTest
 {
     private static final String KEYSPACE1 = "Keyspace1";
-    private static final String CF_DENSE1 = "CF_DENSE1";
-    private static final String CF_STANDARD1 = "CF_STANDARD1";
+    private static final String CF_STANDARD1 = "Standard1";
     private static final String CF_STANDARD2 = "Standard2";
     private static final String CF_STANDARD3 = "Standard3";
     private static final String CF_STANDARD4 = "Standard4";
@@ -445,10 +451,116 @@ public class CompactionsTest
         assertFalse(scanner.hasNext());
     }
 
+    @Test
+    public void testCompactionPropagatesCommitLogIntervals() throws InterruptedException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD4);
+        TableMetadata table = cfs.metadata();
+
+        cfs.clearUnsafe();
+        // disable compaction while flushing
+        cfs.disableAutoCompaction();
+
+        for (int i = 0; i < 2; i++) {
+            DecoratedKey key = Util.dk(String.valueOf(i));
+            new RowUpdateBuilder(table, FBUtilities.timestampMicros(), key.getKey())
+            .clustering(ByteBufferUtil.bytes("cols"))
+            .add("val", "val1")
+            .build().applyUnsafe();
+            Util.flush(cfs);
+        }
+
+        Collection<SSTableReader> sstables = cfs.getLiveSSTables();
+        assertEquals(2, sstables.size());
+
+        Iterator<SSTableReader> sstableIterator = sstables.iterator();
+        SSTableReader sstable1 = sstableIterator.next();
+        SSTableReader sstable2 = sstableIterator.next();
+
+        Set<SSTableId> originalSstablesIds = new HashSet<>();
+        originalSstablesIds.add(sstable1.descriptor.id);
+        originalSstablesIds.add(sstable2.descriptor.id);
+
+        CommitLogPosition lowerBound1 = sstable1.getSSTableMetadata().commitLogIntervals.lowerBound().get();
+        CommitLogPosition upperBound1 = sstable1.getSSTableMetadata().commitLogIntervals.upperBound().get();
+        CommitLogPosition lowerBound2 = sstable2.getSSTableMetadata().commitLogIntervals.lowerBound().get();
+        CommitLogPosition upperBound2 = sstable2.getSSTableMetadata().commitLogIntervals.upperBound().get();
+
+        CommitLogPosition minLowerBound = lowerBound1.compareTo(lowerBound2) < 0 ? lowerBound1 : lowerBound2;
+        CommitLogPosition maxUpperBound = upperBound1.compareTo(upperBound2) > 0 ? upperBound1 : upperBound2;
+
+        assertTrue(minLowerBound.compareTo(maxUpperBound) < 0);
+        assertNotSame(maxUpperBound, CommitLogPosition.NONE);
+
+        String file1 = sstable1.descriptor.fileFor(Components.DATA).absolutePath();
+        String file2 = sstable2.descriptor.fileFor(Components.DATA).absolutePath();
+
+        CompactionManager.instance.forceUserDefinedCompaction(file1 + "," + file2);
+        do
+        {
+            Thread.sleep(100);
+        } while (CompactionManager.instance.getPendingTasks() > 0 || CompactionManager.instance.getActiveCompactions() > 0);
+        // CF should have only one sstable with generation number advanced
+        sstables = cfs.getLiveSSTables();
+        assertEquals(1, sstables.size());
+        SSTableReader compactedSstable = sstables.iterator().next();
+
+        assertFalse(originalSstablesIds.contains(compactedSstable.descriptor.id));
+        assertEquals(minLowerBound, compactedSstable.getSSTableMetadata().commitLogIntervals.lowerBound().get());
+        assertEquals(maxUpperBound, compactedSstable.getSSTableMetadata().commitLogIntervals.upperBound().get());
+    }
+
     private static Range<Token> rangeFor(int start, int end)
     {
         return new Range<Token>(new ByteOrderedPartitioner.BytesToken(String.format("%03d", start).getBytes()),
                                 new ByteOrderedPartitioner.BytesToken(String.format("%03d", end).getBytes()));
+    }
+
+    @Test
+    public void testCleanupPropagatesCommitLogIntervals() throws IOException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+
+        cfs.clearUnsafe();
+        // disable compaction while flushing
+        cfs.disableAutoCompaction();
+
+        // write two groups of 9 keys: [001, 002, ... 008, 009] and [101, 102, ... 108, 109]
+        for (int i = 1; i < 10; i++) {
+            DecoratedKey key = Util.dk(String.format("%03d", i));
+            new RowUpdateBuilder(cfs.metadata(), FBUtilities.timestampMicros(), key.getKey())
+            .clustering(ByteBufferUtil.bytes("cols"))
+            .add("val", "val1")
+            .build().applyUnsafe();
+
+            key = Util.dk(String.format("%03d", i + 100));
+            new RowUpdateBuilder(cfs.metadata(), FBUtilities.timestampMicros(), key.getKey())
+            .clustering(ByteBufferUtil.bytes("cols"))
+            .add("val", "val1")
+            .build().applyUnsafe();
+        }
+        Util.flush(cfs);
+
+        assertEquals(1, cfs.getLiveSSTables().size());
+        SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
+
+        CommitLogPosition lowerBound = sstable.getSSTableMetadata().commitLogIntervals.lowerBound().get();
+        CommitLogPosition upperBound = sstable.getSSTableMetadata().commitLogIntervals.upperBound().get();
+        assertNotSame(upperBound, CommitLogPosition.NONE);
+
+        LifecycleTransaction txn = cfs.getTracker().tryModify(cfs.getLiveSSTables(), OperationType.UNKNOWN);
+        Collection<Range<Token>> ranges = makeRanges(100, 109);
+        CompactionManager.instance.doCleanupOne(cfs, txn, ranges);
+
+        assertEquals(1, cfs.getLiveSSTables().size());
+        SSTableReader cleanedSstable = cfs.getLiveSSTables().iterator().next();
+
+        assertNotSame(cleanedSstable.descriptor.id, sstable.descriptor.id);
+        assertFalse(cleanedSstable.getSSTableMetadata().commitLogIntervals.lowerBound().isPresent());
+        assertFalse(cleanedSstable.getSSTableMetadata().commitLogIntervals.upperBound().isPresent());
+
     }
 
     private static Collection<Range<Token>> makeRanges(int ... keys)
@@ -459,27 +571,12 @@ public class CompactionsTest
         return ranges;
     }
 
-    private static void insertRowWithKey(int key)
-    {
-        long timestamp = System.currentTimeMillis();
-        DecoratedKey dk = Util.dk(String.format("%03d", key));
-        new RowUpdateBuilder(Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD1).metadata(), timestamp, dk.getKey())
-                .add("val", "val")
-                .build()
-                .applyUnsafe();
-        /*
-        Mutation rm = new Mutation(KEYSPACE1, decoratedKey.getKey());
-        rm.add("CF_STANDARD1", Util.cellname("col"), ByteBufferUtil.EMPTY_BYTE_BUFFER, timestamp, 1000);
-        rm.applyUnsafe();
-        */
-    }
-
     @Test
     @Ignore("making ranges based on the keys, not on the tokens")
     public void testNeedsCleanup()
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore store = keyspace.getColumnFamilyStore("CF_STANDARD1");
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD1);
         store.clearUnsafe();
 
         // disable compaction while flushing
@@ -490,9 +587,23 @@ public class CompactionsTest
         //                               201, 202, ... 208, 209
         for (int i = 1; i < 10; i++)
         {
-            insertRowWithKey(i);
-            insertRowWithKey(i + 100);
-            insertRowWithKey(i + 200);
+            DecoratedKey key = Util.dk(String.format("%03d", i));
+            new RowUpdateBuilder(store.metadata(), FBUtilities.timestampMicros(), key.getKey())
+            .clustering(ByteBufferUtil.bytes("cols"))
+            .add("val", "val1")
+            .build().applyUnsafe();
+
+            key = Util.dk(String.format("%03d", i + 100));
+            new RowUpdateBuilder(store.metadata(), FBUtilities.timestampMicros(), key.getKey())
+            .clustering(ByteBufferUtil.bytes("cols"))
+            .add("val", "val1")
+            .build().applyUnsafe();
+
+            key = Util.dk(String.format("%03d", i + 200));
+            new RowUpdateBuilder(store.metadata(), FBUtilities.timestampMicros(), key.getKey())
+            .clustering(ByteBufferUtil.bytes("cols"))
+            .add("val", "val1")
+            .build().applyUnsafe();
         }
         Util.flush(store);
 
